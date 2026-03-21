@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Intelligence Designed To Evolve</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link href="https://db.onlinewebfonts.com/c/8cb707a9b8a73f8a7403336b861c3074?family=BubbledotICG-FinePos" rel="stylesheet" />
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+        integrity="sha512-SnH5WK+bZxgPHs44uWIX+LLJAJ9/2PkPKZ5QiAj6Ta86w+fsb2TkcmfRyVX3pBnMFcV7oQPJkl9QevSCWr3W6A=="
+        crossorigin="anonymous" referrerpolicy="no-referrer" />
+
+  <link rel="icon" href="assets/logo.webp" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body data-view="landing">
+
+  <!-- background video -->
+  <div class="bg">
+    <video class="bg-video" autoplay muted loop playsinline>
+      <source src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260809_012548_ef22562c-c0ae-4816-ad9d-f8922af4e6a7.mp4" type="video/mp4" />
+    </video>
+  </div>
+
+  <div class="page">
+
+    <!-- ============ HEADER ============ -->
+    <header class="header">
+      <a class="logo" href="#" aria-label="CCEA Optimizer home">
+        <img src="assets/logo.webp" alt="" width="52" height="52" />
+      </a>
+
+      <nav class="nav" aria-label="Primary">
+        <a href="#" class="nav-link is-active">Home</a>
+        <a href="#" class="nav-link" data-open-how>How it works</a>
+        <a href="#" class="nav-link" data-github>GitHub</a>
+      </nav>
+
+      <a href="#" class="signin" data-cta>Run analysis</a>
+
+      <button class="burger" aria-label="Open menu" aria-expanded="false" aria-controls="mobile-menu">
+        <span></span><span></span><span></span>
+      </button>
+    </header>
+
+    <!-- ============ HERO ============ -->
+    <main class="hero">
+      <div class="trust anim" style="--d:.05s">
+        <span class="avatars">
+          <span class="avatar a1"><i class="fa-brands fa-python"></i></span>
+          <span class="avatar a2"><i class="fa-brands fa-js"></i></span>
+          <span class="avatar a3"><i class="fa-brands fa-github"></i></span>
+        </span>
+        <span class="trust-pill">Finds the optimal defense combination</span>
+      </div>
+
+      <h1 class="headline anim">
+        <span style="--hd:.12s">Intelligence</span>
+        <span style="--hd:.3s">Designed To Evolve</span>
+      </h1>
+
+      <p class="subhead anim" style="--d:.28s">
+        Upload a signature&ndash;defense report and the cooperative coevolutionary
+        engine returns the optimal defense combination and its fitness.
+      </p>
+
+      <button class="cta anim" style="--d:.4s" data-cta>Get Started</button>
+
+      <label class="rs-toggle anim" style="--d:.46s">
+        <input type="checkbox" id="use-llm" />
+        <span>Use LLM for reduced severity (2 rounds, rate-limited)</span>
+      </label>
+
+      <!-- drag/drop hint shown on dragover -->
+      <div class="drop-hint" aria-hidden="true">Drop your .csv / .xlsx report</div>
+      <p class="upload-error" role="alert" hidden></p>
+    </main>
+
+    <!-- ============ STATS FOOTER ============ -->
+    <footer class="stats">
+      <div class="stat anim" style="--d:.5s">
+        <span class="stat-ico">#</span>
+        <span class="stat-val" data-target="17" data-suffix="" data-decimals="0">0</span>
+        <span class="stat-label">Malware Samples</span>
+      </div>
+      <div class="stat anim" style="--d:.58s">
+        <span class="stat-ico">*</span>
+        <span class="stat-val" data-target="2823" data-suffix="" data-decimals="0">0</span>
+        <span class="stat-label">Defense Candidates</span>
+      </div>
+      <div class="stat anim" style="--d:.66s">
+        <span class="stat-ico">%</span>
+        <span class="stat-val" data-target="0.79" data-suffix="" data-decimals="2">0</span>
+        <span class="stat-label">Mean Best Fitness</span>
+      </div>
+      <div class="stat anim" style="--d:.74s">
+        <span class="stat-ico">&lt;</span>
+        <span class="stat-val" data-target="100" data-suffix="" data-decimals="0">0</span>
+        <span class="stat-label">Max Generations</span>
+      </div>
+    </footer>
+  </div>
+
+  <!-- ============ ANALYZING OVERLAY ============ -->
+  <div class="analyzing" aria-live="polite">
+    <div class="analyzing-inner">
+      <span class="analyzing-mark">&gt;_</span>
+      <p class="analyzing-text">Evaluating&hellip;</p>
+    </div>
+  </div>
+
+  <!-- ============ RESULTS ============ -->
+  <section class="results" aria-label="Optimization results">
+    <div class="results-wrap">
+      <div class="results-head">
+        <button class="back" data-back><i class="fa-solid fa-arrow-left"></i> New report</button>
+        <div class="results-file">
+          <span class="results-filename">&mdash;</span>
+        </div>
+        <button class="download" data-download><i class="fa-solid fa-download"></i> Optimal combinations (CSV)</button>
+      </div>
+
+      <h2 class="results-title">Optimal defense strategy</h2>
+
+      <div class="agg" data-agg></div>
+
+      <div class="tabs" data-tabs role="tablist"></div>
+
+      <div class="panel" data-panel></div>
+    </div>
+  </section>
+
+  <!-- ============ HOW IT WORKS ============ -->
+  <div class="modal-overlay" hidden></div>
+  <div class="modal" id="how-modal" role="dialog" aria-modal="true" aria-label="How it works" hidden>
+    <button class="modal-close" aria-label="Close">&times;</button>
+    <h3 class="modal-title">How it works</h3>
+    <p class="modal-sub">A cooperative coevolutionary search for the best defense per signature.</p>
+    <ol class="flow">
+      <li><span class="flow-n">1</span><div><b>Upload a report</b><p>A CSV / XLSX where each row is a defense candidate &mdash; attack severity, defense strength, reduced severity &mdash; grouped by malware sample.</p></div></li>
+      <li><span class="flow-n">2</span><div><b>Split into subpopulations</b><p>Candidates are grouped one bucket per triggered signature. Each bucket evolves its own part of the defense.</p></div></li>
+      <li><span class="flow-n">3</span><div><b>Assemble a combination</b><p>Every generation picks one representative defense per signature (unexplored &rarr; random exploration &rarr; best-so-far), with occasional mutation, forming one complete defense strategy.</p></div></li>
+      <li><span class="flow-n">4</span><div><b>Score it</b><p>Scores are mapped to [0,1]. Fitness = (IS_Aggr &minus; RS_Aggr) / IS_Aggr, where IS/RS are the RMS of attack severity and remaining severity across all signatures.</p></div></li>
+      <li><span class="flow-n">5</span><div><b>Share the credit</b><p>The combination&rsquo;s fitness is recorded on every candidate that took part, so good team-players get chosen more often.</p></div></li>
+      <li><span class="flow-n">6</span><div><b>Converge</b><p>Repeat until every candidate has been tried and the best combination hasn&rsquo;t improved for 20 generations.</p></div></li>
+      <li><span class="flow-n">7</span><div><b>Result</b><p>The highest-fitness defense combination for each sample, plus its convergence curve.</p></div></li>
+    </ol>
+  </div>
+
+  <!-- ============ MOBILE MENU ============ -->
+  <div class="overlay" hidden></div>
+  <div class="sheet" id="mobile-menu" hidden>
+    <a href="#" class="sheet-link is-active">Home</a>
+    <a href="#" class="sheet-link" data-open-how>How it works</a>
+    <a href="#" class="sheet-link" data-github>GitHub</a>
+    <button class="sheet-cta" data-cta>Run analysis</button>
+  </div>
+
+  <input type="file" id="file-input" accept=".csv,.xlsx,.xlsm" hidden />
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <script src="main.js?v=20260915_fit"></script>
+</body>
+</html>

@@ -1,0 +1,137 @@
+<mxfile host="65bd71144e">
+    <diagram id="ccea-workflow" name="CCEA Workflow">
+        <mxGraphModel dx="1640" dy="996" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1440" pageHeight="2100" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+
+                <mxCell id="AP" value="ATTACK POPULATION&#xa;all attack plans&#xa;(triggered signatures + Attack_Plan_Score)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1" parent="1" vertex="1">
+                    <mxGeometry x="120" y="40" width="340" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="DP" value="DEFENSE POPULATION&#xa;all defense candidates (every CSV row = 1 candidate)&#xa;Defense_ID, Reduced_Severity" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1" parent="1" vertex="1">
+                    <mxGeometry x="560" y="40" width="380" height="80" as="geometry"/>
+                </mxCell>
+
+                <mxCell id="SEL" value="Select one malware sample (Hash)" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="380" y="200" width="320" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="SIG" value="Identify triggered signatures for that sample" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="380" y="300" width="320" height="50" as="geometry"/>
+                </mxCell>
+
+                <mxCell id="SUB" value="Split DEFENSE POPULATION into SUBPOPULATIONS&#xa;one subpopulation per signature" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="340" y="410" width="400" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="PLAN" value="Build COMPLETE ATTACK PLAN&#xa;signatures + attack scores&#xa;(fixed for now - attack side not yet evolved)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" parent="1" vertex="1">
+                    <mxGeometry x="900" y="405" width="360" height="70" as="geometry"/>
+                </mxCell>
+
+                <mxCell id="LOOP" value="GENERATION LOOP (max 100)" style="shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1" parent="1" vertex="1">
+                    <mxGeometry x="420" y="540" width="240" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="REP" value="Representative selection per subpopulation&#xa;unexplored -&gt; random explore (p=0.25) -&gt; best collaborative fitness" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="300" y="670" width="480" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="MUT" value="Mutation (p=0.20)&#xa;swap representative within the same subpopulation" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="350" y="790" width="380" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="COMB" value="Construct COMPLETE DEFENSE COMBINATION&#xa;one representative per signature" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
+                    <mxGeometry x="330" y="910" width="420" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="MAP" value="IMPACT EVALUATION&#xa;map attack severity to [0,1]&#xa;AttackMapped ,  Reduced_Severity / 10" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="320" y="1030" width="440" height="80" as="geometry"/>
+                </mxCell>
+
+                <mxCell id="LLM" value="LLM  (INTEGRATED)&#xa;&#xa;IN:  mapped attack score, defense id,&#xa;complete attack plan, complete defense combination&#xa;OUT:  Reduced_Severity (per signature)&#xa;&#xa;CSV value used as fallback when LLM is disabled" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1" parent="1" vertex="1">
+                    <mxGeometry x="900" y="1010" width="440" height="150" as="geometry"/>
+                </mxCell>
+
+                <mxCell id="FIT" value="FITNESS&#xa;IS_Aggr = RMS(AttackMapped)&#xa;RS_Aggr = RMS(Reduced_Severity mapped)&#xa;Fitness = (IS_Aggr - RS_Aggr) / IS_Aggr" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
+                    <mxGeometry x="330" y="1230" width="420" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="CRED" value="CREDIT ASSIGNMENT&#xa;assign the combination&#39;s fitness to&#xa;every participating candidate" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="350" y="1390" width="380" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="BEST" value="Update global best combination" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="390" y="1510" width="300" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="TERM" value="All candidates evaluated&#xa;AND no improvement for&#xa;PATIENCE (20) ?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" parent="1" vertex="1">
+                    <mxGeometry x="400" y="1610" width="280" height="130" as="geometry"/>
+                </mxCell>
+                <mxCell id="OUT" value="OUTPUT&#xa;optimal defense strategy + convergence history" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
+                    <mxGeometry x="360" y="1800" width="360" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="MULTI" value="Repeat for every malware sample (Hash)" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="390" y="1910" width="300" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="EVALM" value="EVALUATION METRICS (pending)&#xa;vs random / greedy / brute-force baselines,&#xa;multi-seed mean +/- std, aggregate across samples" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;dashed=1" parent="1" vertex="1">
+                    <mxGeometry x="330" y="2010" width="420" height="80" as="geometry"/>
+                </mxCell>
+
+                <mxCell id="e_ap_sel" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.3;entryY=0;entryDx=0;entryDy=0;" parent="1" source="AP" target="SEL" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_dp_sel" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.7;entryY=0;entryDx=0;entryDy=0;" parent="1" source="DP" target="SEL" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_sel_sig" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="SEL" target="SIG" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_sig_sub" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="SIG" target="SUB" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_sig_plan" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="SIG" target="PLAN" edge="1">
+                    <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="820" y="325"/><mxPoint x="820" y="440"/></Array></mxGeometry>
+                </mxCell>
+                <mxCell id="e_sub_loop" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="SUB" target="LOOP" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_loop_rep" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="LOOP" target="REP" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_rep_mut" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="REP" target="MUT" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_mut_comb" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="MUT" target="COMB" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_comb_map" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="COMB" target="MAP" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_plan_map" value="attack plan" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0;exitY=1;entryX=1;entryY=0.35;" parent="1" source="PLAN" target="MAP" edge="1">
+                    <mxGeometry x="-0.4" relative="1" as="geometry"><Array as="points"><mxPoint x="830" y="1058"/></Array></mxGeometry>
+                </mxCell>
+                <mxCell id="e_map_llm" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.7;entryX=0;entryY=0.5;" parent="1" source="MAP" target="LLM" edge="1">
+                    <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="860" y="1094"/><mxPoint x="860" y="1085"/></Array></mxGeometry>
+                </mxCell>
+                <mxCell id="e_llm_fit" value="Reduced_Severity (per signature)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;exitX=0.15;exitY=1;entryX=1;entryY=0.5;" parent="1" source="LLM" target="FIT" edge="1">
+                    <mxGeometry x="0.2" relative="1" as="geometry"><Array as="points"><mxPoint x="960" y="1280"/></Array></mxGeometry>
+                </mxCell>
+                <mxCell id="e_fit_cred" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="FIT" target="CRED" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_cred_best" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="CRED" target="BEST" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_best_term" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="BEST" target="TERM" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_term_loop" value="No (next generation)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=1;entryY=0.5;" parent="1" source="TERM" target="LOOP" edge="1">
+                    <mxGeometry x="-0.85" relative="1" as="geometry"><Array as="points"><mxPoint x="1390" y="1675"/><mxPoint x="1390" y="575"/></Array></mxGeometry>
+                </mxCell>
+                <mxCell id="e_term_out" value="Yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="TERM" target="OUT" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_out_multi" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="OUT" target="MULTI" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_multi_eval" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="MULTI" target="EVALM" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_multi_sel" value="next sample" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;exitX=0;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="MULTI" target="SEL" edge="1">
+                    <mxGeometry x="-0.6" relative="1" as="geometry"><Array as="points"><mxPoint x="180" y="1935"/><mxPoint x="180" y="225"/></Array></mxGeometry>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

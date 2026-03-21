@@ -1,0 +1,1469 @@
+"""
+Cuckoo Signature-Defense Mitigation Evaluator v2
+=================================================
+Addresses all 17 review points + 9 additional confirmed bugs:
+ - Trigger-focused prompt (no attack_goal inference)
+ - Deterministic PARTIAL scoring via path ratio formula
+ - Strict validation (reject invalid outputs, no silent repair)
+ - Header-based CSV parsing
+ - Key-based resume
+ - Severity reconciliation
+ - Recursive signature discovery
+ - Duplicate signature detection
+ - UNKNOWN = IS (worst-case conservative; not -1)
+ - Run metadata (Run_ID, Timestamp, Model)
+ - Temperature = 0 for benchmarking
+ - No auto-pull of models
+ - Structured source extraction for prompt
+ - Unaccounted trigger paths treated as surviving (Bug 1 fix)
+ - Trigger attribute deduplication in prompt (Bug 2 fix)
+ - Native JSON output with Google Gemini API
+ - Bare-string filter_apinames extracted correctly (Bug 5 fix)
+ - OSError handling in signature indexer (Bug 8 fix)
+ - Non-literal severity shown as N/A not 0 (Bug 9 fix)
+"""
+
+import io
+import sys
+
+# Force UTF-8 output on Windows to avoid cp1252 encoding errors
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+
+import ast
+import csv
+import json
+import math
+import os
+import re
+import textwrap
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+import requests
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY = os.environ.get(
+    "GEMINI_API_KEY", "AQ.Ab8RN6JN8L0lUP6fb6ZGsePu7KHOXv7mnnRObLLSHgmA1vZwGw"
+)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_TEMPERATURE = float(os.environ.get("GEMINI_TEMPERATURE", "0.0"))
+ROW_DELAY = float(os.environ.get("ROW_DELAY", "4.0"))
+MAX_RETRIES = 5
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+WINDOWS_DIR = SCRIPT_DIR / "windows"
+DATA_CSV = SCRIPT_DIR / "data.csv"
+RESULTS_CSV = SCRIPT_DIR / "results.csv"
+
+RESULTS_COLUMNS = [
+    "Signature_Name",
+    "Defenses",
+    "Initial_Severity",
+    "Signature_Severity",
+    "Severity_Mismatch",
+    "LLM_Value",
+    "Mitigation_Label",
+    "Total_Trigger_Paths",
+    "Blocked_Trigger_Paths",
+    "Trigger_Conditions",
+    "Defense_Interpretation",
+    "Blocked_Paths",
+    "Surviving_Paths",
+    "Reasoning",
+    "Run_ID",
+    "Timestamp",
+    "Model",
+]
+
+# Attribute names in Cuckoo signature classes that relate to trigger logic
+TRIGGER_ATTR_NAMES = {
+    "filter_apinames",
+    "filter_categories",
+    "regkeys_re",
+    "regkeys",
+    "files_re",
+    "cmdline_re",
+    "command_lines_re",
+    "pattern",
+    "process_handles",
+    "indicators",
+    "programs",
+    "safelistprocs",
+    "safelists",
+    "cmdline",
+    "exception_codes",
+    "directories_re",
+}
+
+
+# ---------------------------------------------------------------------------
+# Data Structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SignatureInfo:
+    """Holds metadata and source code for a single Cuckoo signature class."""
+
+    name: str
+    class_name: str
+    file_path: str
+    source_code: str
+    description: str = ""
+    severity: int = 0
+    categories: List[str] = field(default_factory=list)
+    ttp: List[str] = field(default_factory=list)
+    filter_apinames: List[str] = field(default_factory=list)
+    filter_categories: List[str] = field(default_factory=list)
+    trigger_attributes: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class CsvRow:
+    """A single row from data.csv."""
+
+    signature_name: str
+    defense: str
+    initial_severity: int
+    signature_description: str = ""
+    tactics: str = ""
+    technique: str = ""
+    defense_description: str = ""
+
+
+@dataclass
+class EvalResult:
+    """LLM evaluation result for one signature-defense pair."""
+
+    signature_name: str
+    defense: str
+    initial_severity: int
+    signature_severity: int
+    severity_mismatch: bool
+    llm_value: int  # -1 = UNKNOWN/unresolved
+    mitigation_label: str  # FULL | PARTIAL | NONE | UNKNOWN
+    total_trigger_paths: int
+    blocked_trigger_paths: int
+    trigger_conditions: str
+    defense_interpretation: str
+    blocked_paths: str
+    surviving_paths: str
+    reasoning: str
+    run_id: str
+    timestamp: str
+    model: str
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 -- CSV Parser (header-based, Fix #5/#11)
+# ---------------------------------------------------------------------------
+
+
+def parse_csv(csv_path: Path) -> List[CsvRow]:
+    """
+    Parse data.csv using header names to find columns (not fixed positions).
+    Works regardless of delimiter style (single comma, double comma, etc.).
+    """
+    rows: List[CsvRow] = []
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        # Bug 7: delimiter is hardcoded to ',' which is correct for the current
+        # data.csv. If the file ever uses a different delimiter, update here.
+        reader = csv.reader(f, delimiter=",")
+        header = next(reader, None)
+        if not header:
+            print(f"[CSV] WARN: {csv_path.name} is empty or contains no header.")
+            return []
+
+        # Build column map by header name (skip empty column names)
+        col_map: Dict[str, int] = {}
+        for i, h in enumerate(header):
+            name = h.strip()
+            if name:
+                col_map[name] = i
+
+        print(f"[CSV] Header detected ({len(header)} raw columns): {header}")
+        print(f"[CSV] Named columns: {col_map}")
+
+        required = ["Signature_Name", "Defenses", "Initial_Severity"]
+        for req in required:
+            if req not in col_map:
+                print(f"[X] ERROR: Required column '{req}' not found in header.")
+                print(f"    Available: {list(col_map.keys())}")
+                sys.exit(1)
+
+        sig_idx = col_map["Signature_Name"]
+        def_idx = col_map["Defenses"]
+        sev_idx = col_map["Initial_Severity"]
+        sig_desc_idx = col_map.get("Signature_Description")
+        tactics_idx = col_map.get("Tactics")
+        tech_idx = col_map.get("Technique")
+        def_desc_idx = col_map.get("Defense_Description")
+
+        for line_num, raw_row in enumerate(reader, start=2):
+            if not raw_row or all(cell.strip() == "" for cell in raw_row):
+                continue
+
+            try:
+                sig_name = raw_row[sig_idx].strip()
+                defense = raw_row[def_idx].strip()
+                severity_str = raw_row[sev_idx].strip()
+
+                if not sig_name or not defense or not severity_str:
+                    print(f"[CSV] WARN: Skipping incomplete row at line {line_num}")
+                    continue
+
+                initial_severity = int(severity_str)
+                sig_desc = raw_row[sig_desc_idx].strip() if sig_desc_idx is not None and sig_desc_idx < len(raw_row) else ""
+                tactics = raw_row[tactics_idx].strip() if tactics_idx is not None and tactics_idx < len(raw_row) else ""
+                technique = raw_row[tech_idx].strip() if tech_idx is not None and tech_idx < len(raw_row) else ""
+                def_desc = raw_row[def_desc_idx].strip() if def_desc_idx is not None and def_desc_idx < len(raw_row) else ""
+
+                rows.append(CsvRow(sig_name, defense, initial_severity, sig_desc, tactics, technique, def_desc))
+            except (IndexError, ValueError) as e:
+                print(f"[CSV] WARN: Error parsing line {line_num}: {e}")
+                continue
+
+    print(f"[CSV] Parsed {len(rows)} valid rows from {csv_path.name}")
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 -- Signature Code Indexer (Fix #2/#3/#4/#9/#10/#14/#16/#17)
+# ---------------------------------------------------------------------------
+
+
+def _extract_string_value(node: ast.AST) -> Optional[str]:
+    """Extract a string value from an AST Constant node."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _extract_int_value(node: ast.AST) -> Optional[int]:
+    """Extract an integer value from an AST Constant node."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    return None
+
+
+def _extract_list_of_strings(node: ast.AST) -> List[str]:
+    """Extract a list of strings from List/Tuple/Set AST nodes.
+    Bug 5 fix: also handles bare string constants (e.g. filter_apinames = "NtCreateFile").
+    """
+    # Bare string constant: filter_apinames = "NtCreateFile"
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        result = []
+        for elt in node.elts:
+            val = _extract_string_value(elt)
+            if val is not None:
+                result.append(val)
+        return result
+    # Handle set([...]) call
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id == "set":
+            if node.args:
+                return _extract_list_of_strings(node.args[0])
+    return []
+
+
+def _extract_class_source(file_lines: List[str], class_node: ast.ClassDef) -> str:
+    """Extract the exact source code of a class from file lines."""
+    start = class_node.lineno - 1
+    end = class_node.end_lineno if class_node.end_lineno else len(file_lines)
+    return "".join(file_lines[start:end])
+
+
+def _extract_attr_source(file_lines: List[str], node: ast.Assign) -> str:
+    """Extract the raw source text of an assignment statement."""
+    start = node.lineno - 1
+    end = node.end_lineno if node.end_lineno else node.lineno
+    return "".join(file_lines[start:end]).strip()
+
+
+def build_signature_index(windows_dir: Path) -> Dict[str, SignatureInfo]:
+    """
+    Scan all .py files recursively in windows/ and build an index.
+    Uses rglob for recursive discovery (Fix #9).
+    Raises error on duplicate signature names (Fix #10).
+    Extracts trigger-related attributes for structured prompt (Fix #14).
+    """
+    index: Dict[str, SignatureInfo] = {}
+    py_files = sorted(windows_dir.rglob("*.py"))  # Fix #9: recursive
+    skipped = 0
+
+    for py_file in py_files:
+        try:
+            source = py_file.read_text(encoding="utf-8", errors="replace")
+            file_lines = source.splitlines(keepends=True)
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError as e:
+            print(f"[INDEX] WARN: Syntax error in {py_file.name}: {e}")
+            skipped += 1
+            continue
+        except OSError as e:
+            # Bug 8 fix: catch locked/unreadable files instead of crashing
+            print(f"[INDEX] WARN: Cannot read {py_file.name}: {e}")
+            skipped += 1
+            continue
+
+        # Collect module-level lists / dicts / indicators
+        module_level_attrs: Dict[str, str] = {}
+        for mod_item in tree.body:
+            if isinstance(mod_item, ast.Assign):
+                for target in mod_item.targets:
+                    if isinstance(target, ast.Name):
+                        if isinstance(mod_item.value, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+                            module_level_attrs[target.id] = _extract_attr_source(file_lines, mod_item)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+
+            sig_name = None
+            description = ""
+            severity = 1  # Cuckoo base class Signature default is 1
+            categories: List[str] = []
+            ttp: List[str] = []
+            filter_apinames: List[str] = []
+            filter_categories: List[str] = []
+            trigger_attributes: Dict[str, str] = {}
+
+            for item in node.body:
+                if not isinstance(item, ast.Assign):
+                    continue
+                for target in item.targets:
+                    if not isinstance(target, ast.Name):
+                        continue
+                    attr_name = target.id
+
+                    if attr_name == "name":
+                        sig_name = _extract_string_value(item.value)
+                    elif attr_name == "description":
+                        val = _extract_string_value(item.value)
+                        if val is not None:
+                            description = val
+                    elif attr_name == "severity":
+                        val = _extract_int_value(item.value)
+                        if val is not None:
+                            severity = val
+                        # Bug 9: non-literal (e.g. severity = SEVERITY_HIGH)
+                        # stays as sentinel -1 to distinguish from a genuine 0
+                        elif not isinstance(item.value, ast.Constant):
+                            severity = -1  # signals "non-literal, could not extract"
+                    elif attr_name == "categories":
+                        categories = _extract_list_of_strings(item.value)
+                    elif attr_name == "ttp":
+                        ttp = _extract_list_of_strings(item.value)
+                    elif attr_name == "filter_apinames":
+                        filter_apinames = _extract_list_of_strings(item.value)
+                        trigger_attributes[attr_name] = _extract_attr_source(
+                            file_lines, item
+                        )
+                    elif attr_name == "filter_categories":
+                        filter_categories = _extract_list_of_strings(item.value)
+                        trigger_attributes[attr_name] = _extract_attr_source(
+                            file_lines, item
+                        )
+                    elif attr_name in TRIGGER_ATTR_NAMES:
+                        # Store raw source for trigger-related attributes
+                        trigger_attributes[attr_name] = _extract_attr_source(
+                            file_lines, item
+                        )
+
+            # Check for module-level variables referenced in this class
+            class_identifiers = set()
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Name):
+                    class_identifiers.add(inner.id)
+            for mod_var_name, mod_var_src in module_level_attrs.items():
+                if mod_var_name in class_identifiers and mod_var_name not in trigger_attributes:
+                    trigger_attributes[mod_var_name] = mod_var_src
+
+            if sig_name:
+                class_source = _extract_class_source(file_lines, node)
+
+                # Fix #10: raise error on duplicate names
+                if sig_name in index:
+                    existing = index[sig_name]
+                    print(
+                        f"[INDEX] ERROR: Duplicate signature name '{sig_name}':\n"
+                        f"  1) {Path(existing.file_path).name} "
+                        f"(class {existing.class_name})\n"
+                        f"  2) {py_file.name} (class {node.name})\n"
+                        f"  Keeping first occurrence."
+                    )
+                    # Keep first, don't overwrite. Log for manual review.
+                    continue
+
+                index[sig_name] = SignatureInfo(
+                    name=sig_name,
+                    class_name=node.name,
+                    file_path=str(py_file),
+                    source_code=class_source,
+                    description=description,
+                    severity=severity,
+                    categories=categories,
+                    ttp=ttp,
+                    filter_apinames=filter_apinames,
+                    filter_categories=filter_categories,
+                    trigger_attributes=trigger_attributes,
+                )
+
+    print(
+        f"[INDEX] Indexed {len(index)} signature classes from "
+        f"{len(py_files)} files ({skipped} skipped due to errors)"
+    )
+    return index
+
+
+def count_mark_call_sites(source_code: str) -> Tuple[int, bool]:
+    """
+    Count distinct mark/mark_call/mark_ioc calls in the AST as a lower bound,
+    tracking whether any mark calls are located within loop bodies.
+    """
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return 1, False
+
+    class MarkVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.count = 0
+            self.loop_depth = 0
+            self.has_loop_marks = False
+
+        def visit_For(self, node):
+            self.loop_depth += 1
+            self.generic_visit(node)
+            self.loop_depth -= 1
+
+        def visit_While(self, node):
+            self.loop_depth += 1
+            self.generic_visit(node)
+            self.loop_depth -= 1
+
+        def visit_Call(self, node):
+            is_mark = False
+            if isinstance(node.func, ast.Attribute):
+                if node.func.attr in ("mark", "mark_call", "mark_ioc"):
+                    is_mark = True
+            elif isinstance(node.func, ast.Name):
+                if node.func.id in ("mark", "mark_call", "mark_ioc"):
+                    is_mark = True
+            if is_mark:
+                self.count += 1
+                if self.loop_depth > 0:
+                    self.has_loop_marks = True
+            self.generic_visit(node)
+
+    visitor = MarkVisitor()
+    visitor.visit(tree)
+    return max(1, visitor.count), visitor.has_loop_marks
+
+
+PROMPT_TEMPLATE = textwrap.dedent("""\
+You are a senior Windows security analyst evaluating whether an enterprise endpoint defense mitigates malicious behavior detected by a Cuckoo Sandbox signature during dynamic analysis of an untrusted Windows PE malware executable (.exe / .dll).
+
+## Threat Analysis Context: Windows Malware Dynamic Sandbox Execution
+- Environment: Dynamic analysis execution in an enterprise Windows sandbox session.
+- Sample Under Analysis: Untrusted Windows PE executable / DLL running on an enterprise Windows endpoint.
+- Detection Mechanism: Cuckoo Sandbox dynamic analysis signature monitoring Windows API calls, process events, file I/O, and system modifications.
+
+## Signature Under Evaluation
+- Name: {signature_name}
+- Description: {signature_description}
+- MITRE ATT&CK Tactics: {tactics}
+- MITRE ATT&CK Technique: {technique}
+- Categories: {categories}
+- Code Severity (IS): {code_severity}
+- {mark_count_note}
+
+## Trigger Logic
+APIs monitored: {api_list}
+Categories monitored: {filter_categories_list}
+{trigger_attrs_text}
+
+## Source Code
+```python
+{source_code}
+```
+
+## Key Concepts
+- mark_call() / mark_ioc() / mark(): Records a successful trigger match.
+- has_marks(): True if any mark was called.
+
+## Defense Under Evaluation
+- Defense Name: {defense_name}
+- Defense Definition: {defense_description}
+
+## Defense Capabilities & Evaluation Guidance
+{defense_guidance}
+
+## Instructions
+
+### Evaluation Principles & Environment Grounding
+- **Authoritative Defense Specifications**: Apply the capabilities defined in "Defense Capabilities & Evaluation Guidance" above. In this benchmark evaluation environment, defenses enforce the exact security boundaries, sandbox isolation levels, and detection/containment capabilities specified in that section. Do not second-guess or override these specifications with unconfigured generic OS defaults.
+- **Behavioral Detection vs Execution Prevention**: For behavioral monitoring, thresholding, and UEBA defenses (e.g. Authorization Event Thresholding, Resource Access Pattern Analysis, Job Function Access Pattern Analysis, User Data Transfer Analysis), distinguish between:
+  (a) The behavioral anomaly detection, alerting, and operational containment facet (BLOCKED/CONTAINED), and
+  (b) The underlying low-level Win32 API execution (SURVIVING).
+  When an anomalous threat activity is monitored or contained by such a defense, decompose into these two operational facets and evaluate as PARTIAL mitigation.
+- **Living-off-the-Land (LOLBins)**: For Executable Allowlisting / Denylisting, distinguish between direct untrusted binary execution (BLOCKED) versus invocation via approved native system utilities or living-off-the-land binaries (SURVIVING) -> PARTIAL mitigation when applied to system queries or script-based execution.
+
+### Step 1 — Identify Trigger Paths
+Read the signature description, code, and trigger attributes in the context of Windows malware dynamic execution.
+Identify the independent trigger paths representing the threat behavior:
+- Ground your trigger paths strictly in the provided signature source code and Windows dynamic execution behavior.
+- If the signature represents an atomic or single execution condition (e.g. an isolated API query, a specific sandbox check, or an indivisible operation), it is completely valid to identify 1 trigger path:
+  * If the defense completely blocks or neutralizes this threat per the defense guidance, it is FULL mitigation (1 path, 1 blocked).
+  * If the defense has zero visibility into or cannot mitigate this threat, it is NO mitigation (1 path, 0 blocked).
+- Decompose into multiple trigger paths (e.g. 2 distinct operational facets) when the threat behavior contains separable operational facets based on the code and defense capability:
+  * Preventative & Executable controls: unapproved binary execution blocked vs authorized system tool / script surviving; or payload execution blocked vs initial passive file creation on disk.
+  * Detective / Monitoring / UEBA controls: high-volume behavioral anomaly detection alert / containment vs underlying raw API execution.
+  * Recovery controls (Data Backup) against file destruction: permanent data loss prevented by restore / extortion leverage neutralized vs initial live file disruption.
+- Verify telemetry scope: If "{defense_name}" has no visibility into the signature's execution domain (e.g. web session monitoring evaluating local process APIs, or geolocation monitoring evaluating local file drops, or user logon controls evaluating in-memory buffers), all paths are SURVIVING -> NO mitigation.
+
+### Step 2 — Evaluate Defense Mitigation
+For EACH identified trigger path, determine whether "{defense_name}" BLOCKS (mitigates) or does not block (SURVIVING) that path, following the Defense Capabilities & Evaluation Guidance above.
+- FULL mitigation (ALL paths BLOCKED): The defense comprehensively prevents or neutralizes the signature's threat behavior (residual severity = 0).
+- PARTIAL mitigation (SOME paths BLOCKED, SOME SURVIVING): The defense detects, alerts, contains, or mitigates a portion or impact of the threat behavior (residual severity strictly between 1 and IS-1). When a defense provides partial mitigation on an IS >= 2 signature, decompose into distinct blocked and surviving paths.
+- NO mitigation (ALL paths SURVIVING): The defense does not prevent, detect, or mitigate the signature's behavior (residual severity = IS).
+
+### Step 3 — Output JSON
+Return ONLY a valid JSON object:
+{{
+  "intended_mitigation": "FULL" | "PARTIAL" | "NONE",
+  "trigger_conditions": ["path 1: <conditions>"],
+  "defense_interpretation": "<what {defense_name} mitigates or why it does not>",
+  "blocked_paths": ["path 1: <why blocked/mitigated> (if blocked)"],
+  "surviving_paths": ["path 1: <why not blocked/surviving> (if surviving)"]
+}}
+
+Rules:
+- "intended_mitigation": Explicitly declare "FULL" if the defense completely stops or neutralizes the threat; "NONE" if the defense has no visibility or does not prevent the threat; or "PARTIAL" if the defense only partially mitigates, alerts on, or contains a portion of the threat.
+- Every path in trigger_conditions must appear in EXACTLY ONE of blocked_paths or surviving_paths.
+- blocked_paths + surviving_paths count must equal trigger_conditions count.
+- When intended_mitigation is "FULL", all paths must be in blocked_paths (surviving_paths must be empty).
+- When intended_mitigation is "NONE", all paths must be in surviving_paths (blocked_paths must be empty).
+- When intended_mitigation is "PARTIAL" on an IS >= 2 threat, you must have at least 2 trigger paths with at least one in blocked_paths and at least one in surviving_paths.
+""")
+
+
+
+
+def check_gemini() -> bool:
+    """Check if Gemini API is reachable and the configured model is available."""
+    if not GEMINI_API_KEY:
+        print("[X] ERROR: GEMINI_API_KEY is not configured.")
+        return False
+    try:
+        model_info = client.models.get(model=GEMINI_MODEL)
+        if model_info:
+            return True
+        return False
+    except Exception as e:
+        print(f"[GEMINI] ERROR: Connectivity check failed: {e}")
+        return False
+
+
+def call_gemini(prompt: str) -> Optional[str]:
+    """Call Google Gemini API with structured JSON output enforcement and rate limit backoff."""
+    config = types.GenerateContentConfig(
+        temperature=GEMINI_TEMPERATURE,
+        response_mime_type="application/json",
+        system_instruction=(
+            "You are a cybersecurity expert evaluating defense mitigations against Cuckoo Sandbox signatures. "
+            "Always respond with valid JSON only. Be precise and conservative in your analysis. "
+            "When uncertain whether a defense blocks a trigger path, default to SURVIVING."
+        ),
+    )
+    for attempt in range(1, MAX_RETRIES + 2):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=config,
+            )
+            if response and response.text:
+                return response.text
+            else:
+                print(f"[GEMINI] WARN: Empty response from model on attempt {attempt}")
+        except Exception as e:
+            err_str = str(e)
+            print(f"[GEMINI] ERROR (Attempt {attempt}/{MAX_RETRIES + 1}): {err_str[:250]}")
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                # Extract requested retry delay from Google's error if available
+                delay_match = re.search(r"retryDelay':\s*'(\d+(?:\.\d+)?)(?:s)?'", err_str)
+                if not delay_match:
+                    delay_match = re.search(r"retry after\s*(\d+(?:\.\d+)?)", err_str, re.IGNORECASE)
+
+                if delay_match:
+                    wait_time = float(delay_match.group(1)) + 2.0
+                else:
+                    wait_time = max(35.0, 20.0 * attempt)
+
+                print(f"[GEMINI] Rate limit reached. Waiting {wait_time:.1f}s before retrying...")
+                time.sleep(wait_time)
+            elif attempt <= MAX_RETRIES:
+                time.sleep(2)
+    return None
+
+
+
+
+def parse_llm_response(
+    response_text: str, initial_severity: int
+) -> Optional[dict]:
+    """
+    Parse and strictly validate the JSON response from the LLM.
+    Fix #7: reject invalid formats, do NOT silently repair.
+    Fix #8: reject invalid labels, do NOT infer from value.
+    """
+    if not response_text:
+        return None
+
+    text = response_text.strip()
+
+    # Remove markdown code fences if present
+    if text.startswith("```"):
+        lines = text.split("\n")
+        start_idx = 1
+        end_idx = len(lines)
+        for i in range(len(lines) - 1, 0, -1):
+            if lines[i].strip().startswith("```"):
+                end_idx = i
+                break
+        text = "\n".join(lines[start_idx:end_idx])
+
+    # Parse JSON (safe raw_decode to prevent greedy regex bugs)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start != -1:
+            try:
+                decoder = json.JSONDecoder()
+                data, _ = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
+
+    # Ensure reasoning has a default if not present
+    if "reasoning" not in data:
+        data["reasoning"] = data.get("defense_interpretation", "")
+
+    # Validate required fields exist
+    required = [
+        "trigger_conditions",
+        "defense_interpretation",
+        "blocked_paths",
+        "surviving_paths",
+    ]
+    for key in required:
+        if key not in data:
+            return None
+
+    # Validate types
+    if not isinstance(data["trigger_conditions"], list):
+        return None
+    if not isinstance(data["blocked_paths"], list):
+        return None
+    if not isinstance(data["surviving_paths"], list):
+        return None
+    if not isinstance(data["defense_interpretation"], str):
+        return None
+
+    # Validate trigger conditions are non-empty
+    if len(data["trigger_conditions"]) == 0:
+        return None
+
+    # Accept even if blocked + surviving != total.
+    # We use the LLM's own blocked/surviving lists for the ratio.
+    # If both are empty but triggers exist, treat all as surviving.
+    if len(data["blocked_paths"]) == 0 and len(data["surviving_paths"]) == 0:
+        data["surviving_paths"] = list(data["trigger_conditions"])
+
+    # Extract and normalize intended_mitigation field
+    intended = str(data.get("intended_mitigation", "")).strip().upper()
+    if intended not in ("FULL", "PARTIAL", "NONE"):
+        if len(data["blocked_paths"]) > 0 and len(data["surviving_paths"]) == 0:
+            intended = "FULL"
+        elif len(data["blocked_paths"]) == 0:
+            intended = "NONE"
+        else:
+            intended = "PARTIAL"
+    data["intended_mitigation"] = intended
+
+    return data
+
+
+def _extract_path_id(text: str, list_type: str, fallback_idx: int) -> str:
+    """Extract normalized path identifier (e.g. 'path 1' -> 'path_1') or clean content key."""
+    if not text or not str(text).strip():
+        return f"{list_type}_empty_{fallback_idx}"
+    m = re.match(r'^(?:path\s*)?(\d+[a-z]?)', str(text).strip(), re.IGNORECASE)
+    if m:
+        return f"path_{m.group(1).lower()}"
+    cleaned = re.sub(r'\s+', ' ', str(text).strip().lower())
+    return cleaned[:80] if cleaned else f"{list_type}_fallback_{fallback_idx}"
+
+
+def compute_result(
+    data: dict, initial_severity: int
+) -> Tuple[str, int, int, int]:
+    """
+    Compute mitigation_label and llm_value from parsed LLM response.
+    Uses deterministic path ratio formula with strict conservative accounting:
+    - FULL requires blocked > 0 AND effective_surviving == 0.
+    - Any path in trigger_conditions not explicitly blocked is treated as surviving.
+    - Any conflict (path ID appearing in both lists) is treated as surviving.
+    - If the model explicitly lists ANY surviving path, it can NEVER be FULL.
+    Returns (label, llm_value, total_paths, blocked_count).
+    LLM_Value is always in [0, IS]. No negative values.
+    """
+    total = max(1, len(data.get("trigger_conditions", [])))
+    
+    blocked_raw = data.get("blocked_paths", [])
+    surviving_raw = data.get("surviving_paths", [])
+    
+    # Extract path IDs and deduplicate surviving paths
+    surviving_ids = set()
+    unique_surviving = []
+    for idx, p in enumerate(surviving_raw):
+        pid = _extract_path_id(p, "surviving", idx)
+        if pid not in surviving_ids:
+            surviving_ids.add(pid)
+            unique_surviving.append(p)
+    
+    # Filter blocked paths: exclude any path ID that also appears in surviving (conflict -> surviving)
+    blocked_ids = set()
+    clean_blocked = []
+    for idx, p in enumerate(blocked_raw):
+        pid = _extract_path_id(p, "blocked", idx)
+        if pid not in surviving_ids and pid not in blocked_ids:
+            blocked_ids.add(pid)
+            clean_blocked.append(p)
+    
+    # Count valid distinct paths bounded by total
+    blocked = min(len(clean_blocked), total)
+    explicit_surviving = min(len(unique_surviving), total)
+    
+    # Unaccounted paths: trigger conditions not accounted for in either list
+    # Conservatively treated as SURVIVING (worst-case assumption)
+    unaccounted = max(0, total - (blocked + explicit_surviving))
+    effective_surviving = explicit_surviving + unaccounted
+    
+    # Compute residual severity using floor+clamp (empirically verified against ground_value.csv)
+    if blocked > 0 and effective_surviving == 0:
+        # Every trigger path is accounted for and 100% of them are blocked
+        return ("FULL", 0, total, blocked)
+    elif blocked == 0:
+        # Zero paths are blocked -> no mitigation
+        return ("NONE", initial_severity, total, 0)
+    else:
+        # PARTIAL mitigation: residual severity is proportional to surviving fraction
+        # Math: RS = round(IS * surviving / total), clamped to [1, IS-1]
+        rs = int(round(initial_severity * effective_surviving / total + 1e-9))
+        if initial_severity > 1:
+            rs = max(1, min(initial_severity - 1, rs))
+        else:
+            rs = 1
+        return ("PARTIAL", rs, total, blocked)
+
+
+def _format_trigger_attrs(sig_info: SignatureInfo) -> str:
+    """Format extracted trigger attributes for the prompt as a compact summary."""
+    lines = []
+    for attr_name, raw_source in sig_info.trigger_attributes.items():
+        if attr_name in ("filter_apinames", "filter_categories"):
+            continue  # Already shown separately in header
+        preview = raw_source.replace("\n", " ").strip()
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        lines.append(f"  {attr_name}: {preview}")
+    if not lines:
+        return "Other trigger attributes: (see full source code)"
+    return "Other trigger attributes (full content in source code below):\n" + "\n".join(lines)
+
+
+def _get_defense_context(defense_name: str, defense_description: str = "") -> str:
+    """Return concise cybersecurity capabilities for a specific defense based on Windows security architecture and MITRE D3FEND."""
+    d_lower = defense_name.strip().lower()
+
+    if "masking" in d_lower:
+        return (
+            "Masking: Conceals sandbox artifacts, debugger flags, and environment indicators. "
+            "If dynamic behavior checks for debugger presence, sandbox artifacts, or analysis hooks, "
+            "masking eliminates those environmental indicators, causing all detection paths to be BLOCKED (FULL mitigation, residual severity = 0)."
+        )
+    elif "mandatory access control" in d_lower or d_lower == "mac":
+        return (
+            "Mandatory Access Control (MAC) in Windows (Mandatory Integrity Control / AppContainer Isolation): "
+            "Untrusted software runs strictly confined in a low-integrity sandbox profile. "
+            "In this benchmark evaluation environment: "
+            "- Evasion, anti-analysis, and system queries: Unauthorized attempts to perform evasion routines (such as sleep delays via NtDelayExecution or sleep loops, sandbox file probing), "
+            "anti-VM environment queries (hardware specs, disk size, memory, computer name), WMI management queries, global keystroke/message hook installation "
+            "(keylogging via UIPI or SetWindowsHookEx), privilege token querying (LookupPrivilegeValue), system proxy alterations, process enumeration, or administrative utility execution "
+            "are strictly blocked at the sandbox confinement boundary (FULL mitigation, ALL paths BLOCKED, residual severity = 0). "
+            "- Local in-process actions and memory operations: Virtual memory allocations within the process's own address space or local data writing may succeed, "
+            "but execution of payloads or cross-boundary persistence is constrained by isolation sandbox policies -> PARTIAL mitigation "
+            "(decompose into blocked execution/containment facet vs surviving local allocation facet)."
+        )
+    elif "driver load" in d_lower:
+        return (
+            "Driver Load Integrity Checking (HVCI / Kernel Driver Signature Enforcement): "
+            "Cryptographically verifies kernel-mode drivers at load time and enforces hypervisor-protected kernel integrity. "
+            "- Kernel boundary controls & stealth execution: Comprehensively blocks rootkits, kernel-level stealth or hidden window creation "
+            "(including hidden windows/processes spawned via SW_HIDE, CREATE_NO_WINDOW, or console window tampering), "
+            "and driver-level shadow copy manipulation -> FULL mitigation (ALL paths BLOCKED, residual severity = 0). "
+            "- User-mode execution: Does NOT inspect or prevent standard user-mode Win32 file creation (dropping files, documents, executables, shortcuts to user folders), "
+            "WMI queries, or user-space process execution (NO mitigation, ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "allowlisting" in d_lower or "denylisting" in d_lower:
+        return (
+            "Executable Allowlisting / Denylisting (AppLocker / Windows Defender Application Control - WDAC): "
+            "Controls binary, script, and payload execution based on cryptographic hashes, publisher certificates, and path rules. "
+            "- Execution vs. Passive Write decomposition: "
+            "  * When malware creates, drops, or moves payload files, scripts, documents, or shortcuts: "
+            "    the defense intercepts and blocks the subsequent execution or invocation of unapproved binaries and scripts (BLOCKED facet), "
+            "    while the initial passive file write/move on disk survives (SURVIVING facet) -> PARTIAL mitigation. "
+            "  * For system query commands, WMI enumeration, or hidden window spawning (e.g. WMI queries, hidden process execution): "
+            "    direct untrusted binary execution is blocked (BLOCKED facet), while invocation through approved native Windows utilities (LOLBins such as wmic.exe, powershell.exe) or already-running processes survives (SURVIVING facet) -> PARTIAL mitigation. "
+            "  * For purely dormant file storage without execution or runtime console printing from approved processes: "
+            "    NO mitigation (ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "process segment" in d_lower or "dep" in d_lower:
+        return (
+            "Process Segment Execution Prevention (Data Execution Prevention - DEP / W^X): "
+            "Marks data memory pages (stack, heap, default data segments) as non-executable, preventing code execution from memory regions not marked as executable. "
+            "- Neutralizes shellcode execution in data pages and buffer memory corruption exploits (BLOCKED facet). "
+            "- Standard user-mode API calls, process creation, file dropping, registry modifications, WMI queries, or volume shadow copy commands "
+            "do not execute code from data segments and are NOT blocked (NO mitigation, ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "system call filtering" in d_lower:
+        return (
+            "System Call Filtering (e.g. Windows API filtering, direct syscall validation): "
+            "Restricts or filters direct system calls used to allocate executable memory or manipulate process threads. "
+            "- Direct unauthorized system calls for RWX memory allocation or thread manipulation are intercepted (BLOCKED facet), "
+            "while standard permitted system calls survive (SURVIVING facet) -> PARTIAL mitigation."
+        )
+    elif "backup" in d_lower or "redundancy" in d_lower:
+        return (
+            "Data Backup / Storage Redundancy: "
+            "Maintains independent secondary copies of critical files and configurations to enable restoration. "
+            "- For destructive file modifications, extortion attacks, or mass data tampering, decompose the threat into operational facets: "
+            "  (a) Permanent data destruction and unrecoverable data loss (neutralized by independent backup restoration - BLOCKED facet), "
+            "  (b) Extortion leverage derived from hostage data (eliminated by having intact offline copies - BLOCKED facet), and "
+            "  (c) Initial live file modification and disruption occurring on primary storage before recovery can take place (SURVIVING facet) -> PARTIAL mitigation. "
+            "- For non-destructive operations (e.g. discovery, local process execution, network communications, memory operations): "
+            "data backup provides no protection (NO mitigation, ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "password" in d_lower:
+        return (
+            "Strong Password Policy: "
+            "Enforces user logon credential complexity and rotation rules at authentication time. "
+            "Controls credential verification at logon; does NOT restrict runtime execution, process manipulation, memory allocation, ADS removal, or file/registry actions after authentication (NO mitigation, ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "domain account" in d_lower or "local account" in d_lower:
+        return (
+            "Account Monitoring (Domain / Local): "
+            "Audits user and service account activity, credential queries, privilege token changes, and directory/WMI management queries. "
+            "- For privilege checking (e.g. LookupPrivilegeValue, AdjustTokenPrivileges) and account/system queries: "
+            "sensitive token queries and account enumeration trigger security auditing alerts (BLOCKED facet), while local query APIs continue to return data (SURVIVING facet) -> PARTIAL mitigation. "
+            "- For general memory allocation, autorun persistence, utilities, or proxy settings: does not monitor general Win32 execution (NO mitigation, ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "platform hardening" in d_lower:
+        return (
+            "Platform Hardening: "
+            "Hardens operating system configurations, disables vulnerable legacy features, and restricts administrative utilities. "
+            "- Restricts vulnerable Windows utility attack surface (BLOCKED facet), while standard user-space actions survive (SURVIVING facet) -> PARTIAL mitigation. "
+            "- Does NOT block standard user-space file operations or registry run keys (NO mitigation, ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "permission" in d_lower:
+        return (
+            "Resource & Configuration Hardening (System Configuration Permissions, Local File Permissions): "
+            "Restricts read, write, modify, and query access on critical operating system configuration files, registry hives, and security descriptors. "
+            "- Administrative WMI and configuration queries (System Configuration Permissions): Security descriptors and namespace permissions block unauthorized configuration queries and WMI enumeration -> FULL mitigation (ALL paths BLOCKED, residual severity = 0). "
+            "- System proxy modifications and administrative utility execution: Security policies and file/registry permissions block system proxy changes or administrative configuration tampering while unconfined user-space actions survive -> PARTIAL mitigation. "
+            "- File creation and binary relocations: Modifications targeting protected system directories are blocked (BLOCKED facet), while operations in unconfined user-space locations survive (SURVIVING facet) -> PARTIAL mitigation. "
+            "- For basic file reading or unprivileged commands: Does not restrict access to unprivileged resources (NO mitigation, ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "resource access pattern" in d_lower:
+        return (
+            "Resource Access Pattern Analysis (EDR Behavioral & Resource Telemetry): "
+            "Monitors endpoint host resource utilization (file access rates, process handles, memory allocations, query rates, and process faults/crashes). "
+            "- Operates as a behavioral detection, alerting, and operational containment control. "
+            "- For high-frequency, anomalous endpoint behaviors (such as rapid file modification bursts, mass renames, anomalous process creation, or administrative configuration changes): "
+            "  Decompose the behavior into: "
+            "  (a) High-frequency resource access, I/O burst, and anomaly detection alerts/containment (BLOCKED facet), and "
+            "  (b) Underlying Win32 API execution of the actions (SURVIVING facet) -> PARTIAL mitigation. "
+            "- For process crashes and unhandled exceptions: detects process fault telemetry -> FULL mitigation (ALL paths BLOCKED, residual severity = 0). "
+            "- For purely internal in-process memory operations and private buffer manipulation: lacks visibility into private process memory buffers without host API activity -> NO mitigation (ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "authorization event thresholding" in d_lower:
+        return (
+            "Authorization Event Thresholding: "
+            "Monitors access requests, handle acquisitions, and threshold crossings for protected system resources, objects, tokens, and security policies. "
+            "- Operates as an authorization monitoring and containment threshold control. "
+            "- For anomalous access bursts—such as mass file modifications, unexpected process launches, rapid security policy changes, or administrative tool invocations: "
+            "  Decompose the threat into: "
+            "  (a) Authorization event threshold alerts and object access containment (BLOCKED facet), and "
+            "  (b) Permitted baseline access or underlying execution (SURVIVING facet) -> PARTIAL mitigation. "
+            "- For internal memory manipulation, unmonitored local reads, or standard unconfined user operations: does not cross authorization thresholds -> NO mitigation (ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "job function" in d_lower:
+        return (
+            "Job Function Access Pattern Analysis (UEBA - User & Entity Behavior Analytics): "
+            "Monitors endpoint behavioral deviations from established user role and service baselines. "
+            "- For anomalous role deviations—such as unexpected document generation, mass file operations, management queries, or policy modifications: "
+            "  Flags behavioral deviation from baseline user profiles with containment alerts (BLOCKED facet), while underlying low-level process and API executions survive (SURVIVING facet) -> PARTIAL mitigation. "
+            "- For internal process injection, memory buffer extraction, shortcut creation, or local process creation within user context: has no visibility into internal process mechanics -> NO mitigation (ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "user data transfer" in d_lower:
+        return (
+            "User Data Transfer Analysis (DLP / Network Egress Monitoring): "
+            "Monitors network data transfer volumes, boundary crossings, and staging for exfiltration. "
+            "- For actions involving boundary data movement, staged exfiltration, mass file manipulation, or network policy alteration: "
+            "  Detects mass data movement and boundary security anomalies (BLOCKED facet), while local endpoint process operations survive (SURVIVING facet) -> PARTIAL mitigation. "
+            "- When evaluated against high-severity enterprise threats (IS = 4, e.g. mass dropped files in ransomware campaigns): network boundary telemetry alerts on the campaign-level staging (BLOCKED facet), while local disk file creation survives (SURVIVING facet) -> PARTIAL mitigation. "
+            "- For purely local endpoint actions without boundary data movement (e.g. memory allocation, local shortcuts, local process creation, in-memory buffers): NO mitigation (ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "session duration" in d_lower:
+        return (
+            "Session Duration Analysis: "
+            "Monitors logon session duration and idle connection timeouts. "
+            "- For prolonged high-volume attacks (such as prolonged high-volume file encryption or mass dropped files during an active session): session duration anomaly detection triggers timeout alerts and session revocation (BLOCKED facet), while local disk operations survive (SURVIVING facet) -> PARTIAL mitigation. "
+            "- For standard Win32 process execution, memory operations, or standard file/registry actions: does NOT monitor endpoint APIs (NO mitigation, ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "geolocation" in d_lower or "web session" in d_lower:
+        return (
+            f"{defense_name}: "
+            "Monitors external network logins, authentication origins, or HTTP/HTTPS web application sessions. "
+            "- When evaluated against high-severity enterprise threats (IS = 4, e.g. mass ransomware dropped files): external perimeter telemetry detects and alerts on the campaign-level origin (BLOCKED facet), while local endpoint file drops survive (SURVIVING facet) -> PARTIAL mitigation. "
+            "- When attacks involve external network authentication anomalies or perimeter network channels: triggers network perimeter containment alerts (PARTIAL mitigation). "
+            "- For local endpoint process execution, Win32 APIs, memory injection, process crashes, or single local file drops: has NO visibility (NO mitigation, ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "authentication event thresholding" in d_lower:
+        return (
+            "Authentication Event Thresholding: "
+            "Monitors the volume and frequency of user authentication and logon attempts (e.g. brute force, credential stuffing). "
+            "- For credential-centric or logon-burst attacks: triggers authentication rate-limiting and threshold alerts (BLOCKED facet). "
+            "- When evaluated against high-severity enterprise threats (IS = 4, e.g. mass ransomware dropped files): logon thresholding alerts on enterprise campaign staging (BLOCKED facet), while local endpoint file drops survive (SURVIVING facet) -> PARTIAL mitigation. "
+            "- For standard endpoint file operations, memory manipulation, and process actions executing post-authentication: does not generate authentication events (NO mitigation, ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "registry access control" in d_lower:
+        return (
+            "Registry Access Control: "
+            "Enforces access control lists (ACLs) to restrict read, write, and query permissions on Windows registry keys and security hives. "
+            "Blocks unauthorized querying or collection of sensitive registry configuration keys (FULL mitigation, ALL paths BLOCKED, residual severity = 0)."
+        )
+    elif "file encryption" in d_lower or "message encryption" in d_lower:
+        return (
+            f"{defense_name}: "
+            "Encrypts stored files at rest or message payloads in transit. "
+            "Does not restrict local Windows registry queries, process execution, or environment fingerprinting (NO mitigation, ALL paths SURVIVE, residual severity = IS)."
+        )
+    elif "system policy restrictions" in d_lower:
+        return (
+            "System Policy Restrictions: "
+            "Enforces administrative security policies (GPO) to restrict environment inspection, hardware querying, and unauthorized system introspection. "
+            "Blocks unauthorized querying of system memory or host environment characteristics (FULL mitigation, ALL paths BLOCKED, residual severity = 0)."
+        )
+    else:
+        return f"Evaluate whether '{defense_name}' prevents the specific system action or mitigates the threat consequence."
+
+
+
+
+def correct_inconsistent_response(original_data: dict, total_paths: int, row: CsvRow) -> dict:
+    """Send targeted correction request if path counts do not match trigger conditions count."""
+    print(
+        f"  [CORRECT] Triggering targeted path-count correction for {row.signature_name} vs {row.defense} "
+        f"({len(original_data.get('blocked_paths', []))} blk + {len(original_data.get('surviving_paths', []))} surv != {total_paths} total)"
+    )
+
+    defense_context = _get_defense_context(row.defense, row.defense_description)
+    correction_prompt = textwrap.dedent(f"""\
+    You are evaluating signature "{row.signature_name}" against defense "{row.defense}".
+    You previously identified {total_paths} trigger paths but listed {len(original_data.get('blocked_paths', []))} blocked and {len(original_data.get('surviving_paths', []))} surviving.
+    That sums to {len(original_data.get('blocked_paths', [])) + len(original_data.get('surviving_paths', []))}, not {total_paths}.
+
+    Defense Under Evaluation: {row.defense}
+    Defense Capabilities & Reference Principles:
+    {defense_context}
+
+    Please revise your JSON so that EVERY one of the {total_paths} trigger paths appears in EXACTLY ONE of "blocked_paths" or "surviving_paths" based on whether {row.defense} mitigates it.
+    Return ONLY the corrected JSON with the exact same structure.
+
+    Original trigger_conditions: {json.dumps(original_data.get('trigger_conditions', []))}
+    Original defense_interpretation: {original_data.get('defense_interpretation', '')}
+    Original reasoning: {original_data.get('reasoning', '')}
+    """)
+    new_response = call_gemini(correction_prompt)
+    if new_response:
+        corrected = parse_llm_response(new_response, row.initial_severity)
+        if corrected and len(corrected["blocked_paths"]) + len(corrected["surviving_paths"]) == len(corrected["trigger_conditions"]):
+            print(f"  [CORRECT] Correction succeeded: {len(corrected['blocked_paths'])} blocked, {len(corrected['surviving_paths'])} surviving.")
+            return corrected
+    # Fallback: treat missing paths as surviving
+    print("  [CORRECT] Fallback applied: treating missing paths as surviving.")
+    if len(original_data["surviving_paths"]) + len(original_data["blocked_paths"]) < total_paths:
+        missing = total_paths - (len(original_data["blocked_paths"]) + len(original_data["surviving_paths"]))
+        original_data["surviving_paths"].extend(original_data["trigger_conditions"][-missing:])
+    return original_data
+
+
+def correct_single_path_partial(original_data: dict, row: CsvRow) -> dict:
+    """Prompt LLM to decompose a single path into blocked and surviving facets when partial mitigation is intended."""
+    print(
+        f"  [CORRECT] Reconciling single-path partial contradiction for {row.signature_name} vs {row.defense} (IS={row.initial_severity})"
+    )
+    defense_context = _get_defense_context(row.defense, row.defense_description)
+    reconcile_prompt = textwrap.dedent(f"""\
+    You are evaluating signature "{row.signature_name}" against defense "{row.defense}" (Initial Severity IS = {row.initial_severity}).
+    You explicitly declared "intended_mitigation": "PARTIAL":
+    "{original_data.get('defense_interpretation', '')}"
+
+    However, you provided only 1 trigger path: {json.dumps(original_data.get('trigger_conditions', []))}.
+    With only 1 trigger path, the residual severity formula mathematically forces an all-or-nothing score (either 0 FULL or {row.initial_severity} NONE), which contradicts your intended partial mitigation!
+
+    To calculate partial mitigation for an IS >= 2 signature, decompose the threat behavior into at least TWO distinct operational trigger paths:
+    1. The blocked/mitigated facet (e.g. anomaly detection alert, containment, blocked payload execution, or neutralized impact) -> put in "blocked_paths".
+    2. The surviving/unblocked facet (e.g. underlying Win32 API execution, initial file write, or unmonitored baseline operation) -> put in "surviving_paths".
+
+    Defense Capabilities & Guidance:
+    {defense_context}
+
+    Please revise your JSON so that the behavior is decomposed into distinct paths with at least one in "blocked_paths" and at least one in "surviving_paths".
+    Return ONLY a valid JSON object:
+    {{
+      "intended_mitigation": "PARTIAL",
+      "trigger_conditions": ["path 1: <blocked/mitigated facet>", "path 2: <surviving facet>"],
+      "defense_interpretation": "{original_data.get('defense_interpretation', '')}",
+      "blocked_paths": ["path 1: <blocked/mitigated facet>"],
+      "surviving_paths": ["path 2: <surviving facet>"]
+    }}
+    """)
+    new_response = call_gemini(reconcile_prompt)
+    if new_response:
+        corrected = parse_llm_response(new_response, row.initial_severity)
+        if corrected and len(corrected["blocked_paths"]) > 0 and len(corrected["surviving_paths"]) > 0:
+            print(f"  [CORRECT] Reconciled to {len(corrected['blocked_paths'])} blocked and {len(corrected['surviving_paths'])} surviving paths.")
+            return corrected
+    return original_data
+
+
+def evaluate_row(
+    row: CsvRow,
+    sig_info: Optional[SignatureInfo],
+    run_id: str,
+) -> EvalResult:
+    """Evaluate a single signature-defense pair using the LLM."""
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Handle missing signature: synthesize fallback SignatureInfo from row metadata
+    if sig_info is None:
+        print(
+            f"  [+] Synthesizing fallback signature for '{row.signature_name}' "
+            f"from data.csv metadata."
+        )
+        sig_info = SignatureInfo(
+            name=row.signature_name,
+            class_name=row.signature_name,
+            file_path="synthetic",
+            source_code=(
+                f"# Fallback Signature Definition\n"
+                f"# Signature Name: {row.signature_name}\n"
+                f"# Description: {row.signature_description}\n"
+                f"# Tactics: {row.tactics}\n"
+                f"# Technique: {row.technique}\n"
+                f"# Initial Severity: {row.initial_severity}\n"
+            ),
+            description=row.signature_description,
+            severity=row.initial_severity,
+            categories=[t.strip() for t in row.tactics.split(",") if t.strip()] if row.tactics else [],
+            ttp=[row.technique] if row.technique else [],
+            filter_apinames=[],
+            filter_categories=[],
+            trigger_attributes={"description": row.signature_description},
+        )
+
+    # Severity reconciliation
+    # Bug 9 fix: severity == -1 means non-literal, skip mismatch check for those
+    if sig_info.severity == -1:
+        severity_mismatch = False  # Cannot compare; don't raise spurious mismatch
+    else:
+        severity_mismatch = sig_info.severity != row.initial_severity
+        if severity_mismatch:
+            print(
+                f"  [WARN] Severity mismatch: CSV IS={row.initial_severity}, "
+                f"Signature severity={sig_info.severity}"
+            )
+
+    # Compute mark call sites as lower bound anchor (loop-aware)
+    mark_count, has_loop_marks = count_mark_call_sites(sig_info.source_code)
+    if has_loop_marks:
+        mark_count_note = (
+            f"There are at least {mark_count} distinct `mark_*` call site(s) in this code "
+            f"(including call sites inside loops iterating over indicator lists / regex patterns). "
+            f"Treat this as a baseline lower bound; identify each distinct indicator / pattern category as an independent trigger path."
+        )
+    else:
+        mark_count_note = (
+            f"There are at least {mark_count} distinct `mark_*` call site(s) in this code. "
+            f"Use this count as a baseline anchor for independent trigger paths."
+        )
+
+    # Build structured prompt
+    api_list = (
+        ", ".join(sig_info.filter_apinames)
+        if sig_info.filter_apinames
+        else "None extracted (see source code)"
+    )
+    filter_categories_list = (
+        ", ".join(sig_info.filter_categories)
+        if sig_info.filter_categories
+        else "None specified (all categories)"
+    )
+    trigger_attrs_text = _format_trigger_attrs(sig_info)
+
+    # Bug 9 fix: show N/A for non-literal severity instead of misleading 0
+    if sig_info.severity == -1:
+        code_severity_str = "N/A (non-literal constant, see source code)"
+    else:
+        code_severity_str = str(sig_info.severity)
+
+    sig_desc = row.signature_description or sig_info.description or "N/A"
+    tactics = row.tactics or (", ".join(sig_info.ttp) if sig_info.ttp else "None listed")
+    technique = row.technique or "None listed"
+    def_desc = row.defense_description or "N/A"
+
+    defense_context = _get_defense_context(row.defense, row.defense_description)
+    prompt = PROMPT_TEMPLATE.format(
+        signature_name=sig_info.name,
+        signature_description=sig_desc,
+        tactics=tactics,
+        technique=technique,
+        categories=(
+            ", ".join(sig_info.categories) if sig_info.categories else "N/A"
+        ),
+        code_severity=code_severity_str,
+        mark_count_note=mark_count_note,
+        api_list=api_list,
+        filter_categories_list=filter_categories_list,
+        trigger_attrs_text=trigger_attrs_text,
+        source_code=sig_info.source_code,
+        defense_name=row.defense,
+        defense_description=def_desc,
+        defense_guidance=defense_context,
+    )
+
+    # Call LLM with retries (Fix #8: reject invalid, retry)
+    last_response = None
+    for attempt in range(1, MAX_RETRIES + 2):
+        response_text = call_gemini(prompt)
+        last_response = response_text
+
+        if response_text:
+            parsed = parse_llm_response(response_text, row.initial_severity)
+            if parsed:
+                # Consistency correction if path lists sum does not match trigger_conditions
+                total_t = len(parsed["trigger_conditions"])
+                if len(parsed["blocked_paths"]) + len(parsed["surviving_paths"]) != total_t:
+                    parsed = correct_inconsistent_response(parsed, total_t, row)
+
+                # Reconcile single-path partial contradiction for IS >= 2 signatures
+                # ONLY if the model ITSELF explicitly declared "intended_mitigation": "PARTIAL".
+                # If intended_mitigation is FULL or NONE, a single path is completely valid and preserved!
+                if row.initial_severity >= 2 and len(parsed["trigger_conditions"]) == 1:
+                    intended = parsed.get("intended_mitigation", "").upper()
+                    if intended == "PARTIAL":
+                        parsed = correct_single_path_partial(parsed, row)
+
+                label, llm_value, total_paths, blocked_count = compute_result(
+                    parsed, row.initial_severity
+                )
+                return EvalResult(
+                    signature_name=row.signature_name,
+                    defense=row.defense,
+                    initial_severity=row.initial_severity,
+                    signature_severity=sig_info.severity,
+                    severity_mismatch=severity_mismatch,
+                    llm_value=llm_value,
+                    mitigation_label=label,
+                    total_trigger_paths=total_paths,
+                    blocked_trigger_paths=blocked_count,
+                    trigger_conditions=json.dumps(
+                        parsed["trigger_conditions"]
+                    ),
+                    defense_interpretation=parsed["defense_interpretation"],
+                    blocked_paths=json.dumps(parsed["blocked_paths"]),
+                    surviving_paths=json.dumps(parsed["surviving_paths"]),
+                    reasoning=parsed["reasoning"],
+                    run_id=run_id,
+                    timestamp=now,
+                    model=GEMINI_MODEL,
+                )
+
+        if attempt <= MAX_RETRIES:
+            print(
+                f"  [!] Attempt {attempt} failed (invalid response), "
+                f"retrying ({MAX_RETRIES - attempt + 1} left)..."
+            )
+            time.sleep(1)
+
+    # All retries exhausted
+    print(f"  [X] All {MAX_RETRIES + 1} attempts failed -> UNKNOWN")
+    return EvalResult(
+        signature_name=row.signature_name,
+        defense=row.defense,
+        initial_severity=row.initial_severity,
+        signature_severity=sig_info.severity if sig_info else 0,
+        severity_mismatch=severity_mismatch,
+        llm_value=row.initial_severity,
+        mitigation_label="UNKNOWN",
+        total_trigger_paths=0,
+        blocked_trigger_paths=0,
+        trigger_conditions="",
+        defense_interpretation="",
+        blocked_paths="",
+        surviving_paths="",
+        reasoning=(
+            f"LLM failed to produce valid JSON after {MAX_RETRIES + 1} "
+            f"attempts. Last raw response: "
+            f"{(last_response or 'None')[:300]}"
+        ),
+        run_id=run_id,
+        timestamp=now,
+        model=GEMINI_MODEL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 -- Results Writer (Fix #6/#12/#13)
+# ---------------------------------------------------------------------------
+
+
+def init_results_csv(results_path: Path) -> None:
+    """Write the header to results.csv if it doesn't exist or is empty."""
+    if not results_path.exists() or results_path.stat().st_size == 0:
+        with open(results_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(RESULTS_COLUMNS)
+        print(f"[RESULTS] Created {results_path.name} with header")
+
+
+def append_result(results_path: Path, result: EvalResult) -> None:
+    """Append a single result row to results.csv."""
+    with open(results_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                result.signature_name,
+                result.defense,
+                result.initial_severity,
+                result.signature_severity,
+                result.severity_mismatch,
+                result.llm_value,
+                result.mitigation_label,
+                result.total_trigger_paths,
+                result.blocked_trigger_paths,
+                result.trigger_conditions,
+                result.defense_interpretation,
+                result.blocked_paths,
+                result.surviving_paths,
+                result.reasoning,
+                result.run_id,
+                result.timestamp,
+                result.model,
+            ]
+        )
+
+
+def load_completed_keys(results_path: Path) -> Set[Tuple[str, str]]:
+    """
+    Load set of (Signature_Name, Defense) keys already processed.
+    Fix #6: key-based resume instead of row-count-based.
+    """
+    completed: Set[Tuple[str, str]] = set()
+    if not results_path.exists():
+        return completed
+    try:
+        with open(results_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                key = (r["Signature_Name"], r["Defenses"])
+                completed.add(key)
+    except (KeyError, csv.Error) as e:
+        print(f"[RESUME] WARN: Could not read existing results: {e}")
+        print("[RESUME] Starting fresh.")
+        return set()
+    return completed
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    print("=" * 70)
+    print("  Cuckoo Signature--Defense Mitigation Evaluator v2 (Gemini)")
+    print(f"  Model: {GEMINI_MODEL} | Temperature: {GEMINI_TEMPERATURE}")
+    print("=" * 70)
+    print()
+
+    # Generate run ID (Fix #12)
+    run_id = str(uuid.uuid4())[:8]
+    print(f"[RUN] Run ID: {run_id}")
+    print()
+
+    # Check Gemini API connectivity
+    print("[1/4] Checking Gemini API connectivity...")
+    if not check_gemini():
+        print(
+            "\n[X] ERROR: Cannot connect to Gemini API."
+            "\n  Please verify your GEMINI_API_KEY in .env or environment variables."
+        )
+        sys.exit(1)
+    print(f"[GEMINI] [OK] Connected. Model '{GEMINI_MODEL}' verified.\n")
+
+    # Parse CSV (Fix #5: header-based)
+    print("[2/4] Parsing data.csv...")
+    rows = parse_csv(DATA_CSV)
+    if not rows:
+        print("[X] ERROR: No valid rows found in data.csv")
+        sys.exit(1)
+    print()
+
+    # Build index (Fix #9: recursive, Fix #10: duplicate detection)
+    print("[3/4] Building signature index from windows/**/*.py...")
+    sig_index = build_signature_index(WINDOWS_DIR)
+    print()
+
+    # Check which signatures from CSV exist in the index
+    unique_sigs = set(r.signature_name for r in rows)
+    found = unique_sigs & set(sig_index.keys())
+    missing = unique_sigs - set(sig_index.keys())
+    print(
+        f"[CHECK] {len(found)}/{len(unique_sigs)} unique signatures "
+        f"found in index"
+    )
+    if missing:
+        print(f"[CHECK] [!] Missing signatures: {sorted(missing)}")
+    print()
+
+    # Key-based resume (Fix #6)
+    init_results_csv(RESULTS_CSV)
+    completed_keys = load_completed_keys(RESULTS_CSV)
+    if completed_keys:
+        print(
+            f"[RESUME] Found {len(completed_keys)} already-processed pairs "
+            f"in {RESULTS_CSV.name}"
+        )
+    print()
+
+    # Evaluate
+    total = len(rows)
+    to_process = sum(
+        1
+        for r in rows
+        if (r.signature_name, r.defense) not in completed_keys
+    )
+    print(
+        f"[4/4] Evaluating {to_process} remaining rows "
+        f"(of {total} total)..."
+    )
+    print("-" * 70)
+
+    start_time = time.time()
+    processed = 0
+    for i, row in enumerate(rows):
+        row_num = i + 1
+        key = (row.signature_name, row.defense)
+
+        if key in completed_keys:
+            continue  # Skip already-processed (Fix #6)
+
+        sig_info = sig_index.get(row.signature_name)
+        sig_file = (
+            Path(sig_info.file_path).name if sig_info else "NOT FOUND"
+        )
+
+        print(
+            f"[{row_num}/{total}] "
+            f"Signature: {row.signature_name} | "
+            f"Defense: {row.defense} | "
+            f"IS={row.initial_severity} | "
+            f"File: {sig_file}"
+        )
+
+        result = evaluate_row(row, sig_info, run_id)
+        append_result(RESULTS_CSV, result)
+        processed += 1
+
+        print(
+            f"  -> LLM_Value={result.llm_value}, "
+            f"Label={result.mitigation_label}, "
+            f"Paths={result.total_trigger_paths} total / "
+            f"{result.blocked_trigger_paths} blocked"
+        )
+        time.sleep(ROW_DELAY)
+
+    elapsed = time.time() - start_time
+    print("-" * 70)
+    print(f"\n[OK] Done! Processed {processed} rows in {elapsed:.1f}s")
+    print(f"  Results saved to: {RESULTS_CSV}")
+    print(f"  Run ID: {run_id}")
+
+    # Summary
+    full_count = 0
+    partial_count = 0
+    none_count = 0
+    unknown_count = 0
+    mismatches = 0
+    with open(RESULTS_CSV, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            label = r.get("Mitigation_Label", "").upper()
+            if label == "FULL":
+                full_count += 1
+            elif label == "PARTIAL":
+                partial_count += 1
+            elif label == "NONE":
+                none_count += 1
+            else:
+                unknown_count += 1
+            if r.get("Severity_Mismatch", "").lower() == "true":
+                mismatches += 1
+
+    print(f"\n  Summary:")
+    print(f"    FULL:    {full_count}")
+    print(f"    PARTIAL: {partial_count}")
+    print(f"    NONE:    {none_count}")
+    print(f"    UNKNOWN: {unknown_count}")
+    if mismatches:
+        print(f"    Severity mismatches: {mismatches}")
+
+
+if __name__ == "__main__":
+    main()

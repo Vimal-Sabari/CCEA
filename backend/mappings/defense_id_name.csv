@@ -1,0 +1,43 @@
+Defense_ID,Defense_Name
+1,Application Configuration Hardening
+2,Authentication Event Thresholding
+3,Authorization Event Thresholding
+4,Data Backup
+5,Domain Account Monitoring
+6,Driver Load Integrity Checking
+7,Executable Allowlisting
+8,Executable Denylisting
+9,File Content Rules
+10,File Encryption
+11,File Hashing
+12,Inbound Traffic Filtering
+13,Job Function Access Pattern Analysis
+14,Local Account Monitoring
+15,Local File Permissions
+16,Mandatory Access Control
+17,Masking
+18,Message Encryption
+19,Network Isolation
+20,Network Traffic Analysis
+21,Outbound Traffic Filtering
+22,Platform Hardening
+23,Process Analysis
+24,Process Segment Execution Prevention
+25,Registry Access Control
+26,Resource Access Pattern Analysis
+27,Session Duration Analysis
+28,Strong Password Policy
+29,System Call Filtering
+30,System Configuration Permissions
+31,User Data Transfer Analysis
+32,User Geolocation Logon Pattern Analysis
+33,Web Session Activity Analysis
+34,System Policy Restrictions
+35,System File Analysis
+36,Service Binary Verification
+37,Bootloader Authentication
+38,TPM Boot Integrity
+39,Certificate Pinning
+40,Shadow Stack Comparisons
+41,Application Hardening
+42,Exception Handler Pointer Validation
